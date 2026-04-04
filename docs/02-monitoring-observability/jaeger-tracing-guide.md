@@ -403,8 +403,10 @@ data:
       "service_strategies": [
         {
           "service": "payment-service",
+          // WARNING: param 1.0 = 100% sampling. Only use in development/debugging.
+          // In production, use 0.01-0.10 (1%-10%) to limit overhead and storage.
           "type": "probabilistic",
-          "param": 1.0          
+          "param": 1.0
         },
         {
           "service": "frontend",

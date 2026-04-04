@@ -205,7 +205,7 @@ prometheus:
 # Grafana configuration
 grafana:
   enabled: true
-  adminPassword: "admin123"
+  adminPassword: "<REPLACE_WITH_SECURE_PASSWORD>"  # Use a strong password; never commit real passwords to git
   service:
     type: NodePort
     nodePort: 32000
