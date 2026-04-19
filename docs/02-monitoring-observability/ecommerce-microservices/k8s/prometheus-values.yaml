@@ -1,0 +1,215 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Helm values for kube-prometheus-stack
+# Deploy with:
+#   helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     --namespace monitoring --create-namespace \
+#     --values k8s/prometheus-values.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Prometheus ────────────────────────────────────────────────────────────────
+prometheus:
+  prometheusSpec:
+    retention: 30d
+    retentionSize: "10GB"
+
+    # Allow ServiceMonitors from any namespace to be picked up
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelector: {}
+    serviceMonitorSelector: {}
+    podMonitorNamespaceSelector: {}
+    serviceMonitorNamespaceSelector: {}
+
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 20Gi
+
+    # Pod-annotation-based scraping (fallback for pods without ServiceMonitor)
+    additionalScrapeConfigs:
+      - job_name: 'kubernetes-pods-annotation'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [dev, test]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+            replacement: $1
+            # Spring Boot Actuator default: /actuator/prometheus
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+# ── Grafana ───────────────────────────────────────────────────────────────────
+grafana:
+  adminUser: admin
+  adminPassword: "DevOpsLab2026!"   # Change before production use
+
+  service:
+    type: LoadBalancer
+
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          isDefault: true
+          access: proxy
+
+  # Pre-import community dashboards (no manual setup needed)
+  dashboards:
+    default:
+      node-exporter-full:
+        gnetId: 1860
+        revision: 36
+        datasource: Prometheus
+      k8s-cluster-overview:
+        gnetId: 315
+        revision: 3
+        datasource: Prometheus
+      k8s-pods:
+        gnetId: 13770
+        revision: 1
+        datasource: Prometheus
+      nodejs-app:
+        gnetId: 11159
+        revision: 1
+        datasource: Prometheus
+
+# ── Alertmanager ──────────────────────────────────────────────────────────────
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname', 'namespace', 'service']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: 'slack-notifications'
+    receivers:
+      - name: 'slack-notifications'
+        slack_configs:
+          - api_url: 'YOUR_SLACK_WEBHOOK_URL'   # Replace with your Slack webhook
+            channel: '#devops-alerts'
+            title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
+            text: |
+              {{ range .Alerts }}
+              *Service:* {{ .Labels.service }}  |  *Namespace:* {{ .Labels.namespace }}
+              *Alert:* {{ .Annotations.summary }}
+              *Details:* {{ .Annotations.description }}
+              {{ end }}
+    inhibit_rules:
+      - source_matchers: [severity="critical"]
+        target_matchers: [severity="warning"]
+        equal: ['alertname', 'namespace', 'service']
+
+# ── Alert Rules for 8 Microservices ──────────────────────────────────────────
+additionalPrometheusRulesMap:
+  ecommerce-rules:
+    groups:
+      - name: ecommerce-microservices
+        interval: 30s
+        rules:
+          # High error rate on any service
+          - alert: HighErrorRate
+            expr: |
+              (
+                sum(rate(http_requests_total{status_code=~"5..", namespace=~"dev|test"}[5m])) by (service, namespace)
+                /
+                sum(rate(http_requests_total{namespace=~"dev|test"}[5m])) by (service, namespace)
+              ) * 100 > 10
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "High error rate on {{ $labels.service }} ({{ $labels.namespace }})"
+              description: "Error rate is {{ $value | printf \"%.1f\" }}% — threshold is 10%"
+
+          # Service not responding (no metrics = target down)
+          - alert: ServiceDown
+            expr: up{namespace=~"dev|test"} == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Service DOWN: {{ $labels.service }} ({{ $labels.namespace }})"
+              description: "Prometheus cannot scrape {{ $labels.pod }}"
+
+          # High P99 latency
+          - alert: HighLatency
+            expr: |
+              histogram_quantile(0.99,
+                sum(rate(http_request_duration_seconds_bucket{namespace=~"dev|test"}[5m])) by (le, service, namespace)
+              ) > 2
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High P99 latency on {{ $labels.service }} ({{ $labels.namespace }})"
+              description: "P99 latency is {{ $value | printf \"%.2f\" }}s — threshold is 2s"
+
+          # High memory usage
+          - alert: HighMemoryUsage
+            expr: |
+              (
+                process_resident_memory_bytes{namespace=~"dev|test"}
+                / (128 * 1024 * 1024)   # 128Mi limit
+              ) * 100 > 85
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High memory on {{ $labels.service }} ({{ $labels.namespace }})"
+              description: "Memory usage is {{ $value | printf \"%.1f\" }}% of limit"
+
+# ── Node Exporter / kube-state-metrics ───────────────────────────────────────
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true
+
+defaultRules:
+  create: true
+  rules:
+    kubernetesApps: true
+    kubernetesResources: true
+    kubernetesStorage: true
+    node: true
+    nodeExporterAlerting: true
+    prometheus: true

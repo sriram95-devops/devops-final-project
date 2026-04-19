@@ -1,0 +1,38 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# ONE ServiceMonitor covers ALL 8 services in BOTH dev and test namespaces.
+# DevOps manages this file — no developer involvement needed.
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ecommerce-all-services
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack   # Must match your Helm release name
+spec:
+  # Watch both dev and test namespaces in the same cluster
+  namespaceSelector:
+    matchNames:
+      - dev
+      - test
+
+  # Only scrape services that have label: monitor="true"
+  # All 8 service manifests already have this label
+  selector:
+    matchLabels:
+      monitor: "true"
+
+  endpoints:
+    - port: http
+      path: /actuator/prometheus
+      interval: 15s
+      # Add useful labels to every metric for easier filtering in Grafana
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_service_name]
+          targetLabel: service
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_label_team]
+          targetLabel: team

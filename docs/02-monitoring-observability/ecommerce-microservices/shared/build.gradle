@@ -1,0 +1,46 @@
+plugins {
+    id 'org.springframework.boot' version '3.2.5'
+    id 'io.spring.dependency-management' version '1.1.4'
+    id 'java'
+}
+
+group   = 'com.ecommerce'
+version = '1.0.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Spring Boot Web (embedded Tomcat, REST controllers)
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+
+    // Spring Actuator — exposes /actuator/health and /actuator/prometheus
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+    // Micrometer Prometheus registry — converts Actuator metrics to Prometheus format
+    runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
+
+    // Tests
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+// Produce a single executable fat JAR
+tasks.named('bootJar') {
+    archiveFileName = 'app.jar'
+}
+
+// Disable the plain JAR so only app.jar is produced
+tasks.named('jar') {
+    enabled = false
+}
+
+test {
+    useJUnitPlatform()
+}
