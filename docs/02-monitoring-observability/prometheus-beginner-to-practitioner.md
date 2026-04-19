@@ -120,124 +120,127 @@ process_resident_memory_bytes 52428800
 
 ---
 
-## 3. Simple Sample Project — Deploy & Monitor a Node.js App
+## 3. Sample Project — 8 Microservices Monitored by Prometheus
 
-> This is a real mini project you will deploy on AKS and on Azure VMs. It includes a Node.js web server that exposes Prometheus metrics, so you can actually see monitoring data flowing.
+> **Real-world scenario:** You are a DevOps engineer on a team that built an e-commerce platform. There are **8 microservices** deployed across two namespaces (`dev` and `test`) in the same AKS cluster. Developers wrote the services — your job is to configure Prometheus to monitor all of them **without touching a single line of application code**.
 
-### 3.1 The Sample Application
+### 3.0 Architecture Overview
 
-The app does two things:
-- Serves HTTP requests on port 8080
-- Exposes Prometheus metrics on port 8080/metrics
+```
+AKS Cluster
+├── namespace: dev  (developers actively working here)
+│   ├── api-gateway        (pod) → routes traffic to all services
+│   ├── user-service        (pod) → user registration/login
+│   ├── product-service     (pod) → product catalog
+│   ├── order-service       (pod) → order placement
+│   ├── payment-service     (pod) → payment processing
+│   ├── inventory-service   (pod) → stock management
+│   ├── notification-service(pod) → sends emails/SMS
+│   └── auth-service        (pod) → JWT token management
+│
+├── namespace: test  (same 8 services, QA testing here)
+│   └── (same 8 pods as dev)
+│
+└── namespace: monitoring
+    ├── Prometheus  ← scrapes ALL 8 pods in dev AND test automatically
+    ├── Grafana     ← dashboards
+    └── Alertmanager← sends Slack/email alerts
+```
 
-**File: `app.js`**
+**Key DevOps insight:** Prometheus discovers ALL pods in both namespaces automatically using a **single scrape config**. You never touch app code.
+
+---
+
+### 3.1 The Shared Application Template (Developer's responsibility)
+
+> **As a DevOps engineer**, you don't write this code. But you need to know what it looks like so you can verify the `/metrics` endpoint exists and understand what labels developers expose.
+
+All 8 microservices share the same pattern — only the `SERVICE_NAME` environment variable changes:
+
+**File: `shared/app.js`** (used by all 8 services)
 ```javascript
 const express = require('express');
 const promClient = require('prom-client');
 
 const app = express();
 
-// ─── Step 1: Create a Prometheus registry ───────────────────────────────────
-const register = new promClient.Registry();
+// SERVICE_NAME is injected by Kubernetes as an env variable
+// DevOps sets this in the Deployment manifest — no code change needed
+const SERVICE_NAME = process.env.SERVICE_NAME || 'unknown-service';
+const ENV = process.env.APP_ENV || 'dev';   // 'dev' or 'test'
 
-// Auto-collect default Node.js metrics (CPU, memory, event loop, etc.)
+// ─── Prometheus Setup ────────────────────────────────────────────────────────
+const register = new promClient.Registry();
+register.setDefaultLabels({ service: SERVICE_NAME, env: ENV });
 promClient.collectDefaultMetrics({ register });
 
-// ─── Step 2: Define custom metrics ──────────────────────────────────────────
-
-// Counter: total HTTP requests (only goes up)
+// Counter: HTTP requests (labelled with service name automatically)
 const httpRequestsTotal = new promClient.Counter({
-  name: 'myapp_http_requests_total',
-  help: 'Total number of HTTP requests',
+  name: 'http_requests_total',
+  help: 'Total HTTP requests',
   labelNames: ['method', 'route', 'status_code'],
   registers: [register],
 });
 
-// Gauge: current active connections (goes up and down)
-const activeConnections = new promClient.Gauge({
-  name: 'myapp_active_connections',
-  help: 'Number of active connections right now',
-  registers: [register],
-});
-
-// Histogram: how long requests take (in seconds)
+// Histogram: request duration
 const httpRequestDuration = new promClient.Histogram({
-  name: 'myapp_http_request_duration_seconds',
+  name: 'http_request_duration_seconds',
   help: 'HTTP request duration in seconds',
   labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],   // bucket boundaries in seconds
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
   registers: [register],
 });
 
-// ─── Step 3: Middleware to track every request ───────────────────────────────
+// Gauge: active connections
+const activeConnections = new promClient.Gauge({
+  name: 'active_connections',
+  help: 'Current active connections',
+  registers: [register],
+});
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
+  if (req.path === '/metrics' || req.path === '/health') return next();
   activeConnections.inc();
   const end = httpRequestDuration.startTimer();
-
   res.on('finish', () => {
-    httpRequestsTotal.inc({
-      method: req.method,
-      route: req.route ? req.route.path : req.path,
-      status_code: res.statusCode,
-    });
-    end({ method: req.method, route: req.route ? req.route.path : req.path, status_code: res.statusCode });
+    httpRequestsTotal.inc({ method: req.method, route: req.path, status_code: res.statusCode });
+    end({ method: req.method, route: req.path, status_code: res.statusCode });
     activeConnections.dec();
   });
   next();
 });
 
-// ─── Step 4: Application routes ─────────────────────────────────────────────
-
-// Healthy response
-app.get('/', (req, res) => {
-  res.json({ message: 'Hello from monitored app!', timestamp: new Date() });
-});
-
-// Simulates slow response (for testing latency scenarios)
+// ─── Routes (each service adds its own business logic here) ─────────────────
+app.get('/', (req, res) => res.json({ service: SERVICE_NAME, env: ENV, status: 'running' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: SERVICE_NAME }));
 app.get('/slow', async (req, res) => {
-  const delay = Math.floor(Math.random() * 2000) + 500; // 500ms - 2500ms
-  await new Promise(resolve => setTimeout(resolve, delay));
-  res.json({ message: 'Slow response', delayMs: delay });
+  await new Promise(r => setTimeout(r, Math.floor(Math.random() * 2000) + 300));
+  res.json({ service: SERVICE_NAME, message: 'slow response simulated' });
 });
-
-// Simulates errors (for testing error rate scenarios)
 app.get('/error', (req, res) => {
-  if (Math.random() < 0.7) {   // 70% chance of error
-    res.status(500).json({ error: 'Simulated server error' });
-  } else {
-    res.json({ message: 'Lucky! No error this time.' });
-  }
+  Math.random() < 0.5
+    ? res.status(500).json({ error: 'simulated error', service: SERVICE_NAME })
+    : res.json({ ok: true, service: SERVICE_NAME });
 });
 
-// Health check endpoint (used by K8s liveness/readiness probes)
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
-
-// ─── Step 5: Prometheus metrics endpoint ────────────────────────────────────
-// This is what Prometheus scrapes every 15 seconds
+// ─── /metrics endpoint — THIS IS WHAT PROMETHEUS SCRAPES ────────────────────
 app.get('/metrics', async (req, res) => {
   res.setHeader('Content-Type', register.contentType);
   res.end(await register.metrics());
 });
 
-// ─── Start server ────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`App running on port ${PORT}`);
-  console.log(`Metrics available at http://localhost:${PORT}/metrics`);
-});
+app.listen(PORT, () => console.log(`[${SERVICE_NAME}] running on :${PORT} | env=${ENV}`));
 ```
 
-**File: `package.json`**
+**File: `shared/package.json`**
 ```json
 {
-  "name": "prometheus-demo-app",
+  "name": "ecommerce-service",
   "version": "1.0.0",
   "main": "app.js",
-  "scripts": {
-    "start": "node app.js"
-  },
+  "scripts": { "start": "node app.js" },
   "dependencies": {
     "express": "^4.18.2",
     "prom-client": "^15.1.0"
@@ -245,169 +248,347 @@ app.listen(PORT, () => {
 }
 ```
 
-**File: `Dockerfile`**
+**File: `shared/Dockerfile`** (one Dockerfile for all 8 services)
 ```dockerfile
 FROM node:20-alpine
-
 WORKDIR /app
-
-# Copy package files and install dependencies
 COPY package*.json ./
 RUN npm ci --only=production
-
-# Copy application code
 COPY app.js ./
-
-# Run as non-root user (security best practice)
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 USER appuser
-
 EXPOSE 8080
-
 CMD ["node", "app.js"]
 ```
 
-### 3.2 Build and push the Docker image
+---
+
+### 3.2 Build and push all 8 images
+
+> **DevOps task:** Build one image per service with a different tag, or use a single image and control behavior via environment variables.
 
 ```bash
-# Set your container registry (use Azure Container Registry or Docker Hub)
-ACR_NAME="yourregistry"        # Your ACR name
-IMAGE_NAME="prometheus-demo-app"
-IMAGE_TAG="v1.0"
-
-# Login to Azure Container Registry
+ACR_NAME="yourregistry"   # Your Azure Container Registry name
 az acr login --name $ACR_NAME
 
-# Build the image
-docker build -t ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG} .
+# All 8 services use the SAME Dockerfile — SERVICE_NAME is set by K8s env var
+SERVICES=(
+  api-gateway
+  user-service
+  product-service
+  order-service
+  payment-service
+  inventory-service
+  notification-service
+  auth-service
+)
 
-# Push to registry
-docker push ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}
+for SERVICE in "${SERVICES[@]}"; do
+  echo "Building: $SERVICE"
+  docker build \
+    -t ${ACR_NAME}.azurecr.io/ecommerce/${SERVICE}:v1.0 \
+    ./shared/
+  docker push ${ACR_NAME}.azurecr.io/ecommerce/${SERVICE}:v1.0
+done
 
-echo "Image pushed: ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}"
+echo "All 8 images pushed!"
 ```
 
-### 3.3 Kubernetes manifests for the sample app
+---
 
-**File: `k8s/deployment.yaml`**
+### 3.3 Kubernetes manifests — DevOps controls everything here
+
+> **This is your zone as a DevOps engineer.** You set `SERVICE_NAME`, resource limits, health checks, replicas, and — most importantly — the Prometheus scrape annotations. No developer involvement needed.
+
+**File: `k8s/services-template.yaml`** — Shows 2 of the 8 services; all others follow the same pattern:
+
 ```yaml
+# ════════════════════════════════════════════════════════════
+# 1. api-gateway  (dev namespace)
+# ════════════════════════════════════════════════════════════
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: prometheus-demo-app
-  namespace: demo
+  name: api-gateway
+  namespace: dev
   labels:
-    app: prometheus-demo-app
+    app: api-gateway
+    team: platform
+    monitored-by: prometheus   # custom label for grouping in Grafana
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: prometheus-demo-app
+      app: api-gateway
   template:
     metadata:
       labels:
-        app: prometheus-demo-app
+        app: api-gateway
+        team: platform
       annotations:
-        # These annotations tell Prometheus to scrape this pod
+        # ── DevOps adds these 3 lines — this is ALL you need for Prometheus ──
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
       containers:
-        - name: app
-          image: yourregistry.azurecr.io/prometheus-demo-app:v1.0   # Change this
+        - name: api-gateway
+          image: yourregistry.azurecr.io/ecommerce/api-gateway:v1.0
           ports:
             - containerPort: 8080
-          # Resource limits (important for monitoring scenarios)
+          env:
+            - name: SERVICE_NAME         # DevOps sets this — no code change
+              value: "api-gateway"
+            - name: APP_ENV
+              value: "dev"
           resources:
-            requests:
-              cpu: 50m
-              memory: 64Mi
-            limits:
-              cpu: 200m
-              memory: 128Mi
-          # Health checks
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
           livenessProbe:
-            httpGet:
-              path: /health
-              port: 8080
+            httpGet: { path: /health, port: 8080 }
             initialDelaySeconds: 10
             periodSeconds: 10
           readinessProbe:
-            httpGet:
-              path: /health
-              port: 8080
+            httpGet: { path: /health, port: 8080 }
             initialDelaySeconds: 5
             periodSeconds: 5
-          env:
-            - name: PORT
-              value: "8080"
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: prometheus-demo-app
-  namespace: demo
+  name: api-gateway
+  namespace: dev
   labels:
-    app: prometheus-demo-app
+    app: api-gateway
+    monitor: "true"          # used by ServiceMonitor selector below
 spec:
   selector:
-    app: prometheus-demo-app
+    app: api-gateway
   ports:
     - name: http
       port: 80
       targetPort: 8080
   type: ClusterIP
 ---
-# ServiceMonitor tells kube-prometheus-stack to scrape this service
+# ════════════════════════════════════════════════════════════
+# 2. order-service  (dev namespace)
+# ════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: dev
+  labels:
+    app: order-service
+    team: orders
+    monitored-by: prometheus
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+        team: orders
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: order-service
+          image: yourregistry.azurecr.io/ecommerce/order-service:v1.0
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SERVICE_NAME
+              value: "order-service"
+            - name: APP_ENV
+              value: "dev"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: dev
+  labels:
+    app: order-service
+    monitor: "true"
+spec:
+  selector:
+    app: order-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+```
+
+> **All 8 services follow this exact pattern.** Only `name`, `image`, and `SERVICE_NAME` env var change. Copy-paste and update for:
+> `user-service`, `product-service`, `payment-service`, `inventory-service`, `notification-service`, `auth-service`.
+
+---
+
+### 3.4 Single ServiceMonitor — covers ALL 8 services in BOTH namespaces
+
+> **Key DevOps concept:** You write **ONE** ServiceMonitor object and Prometheus discovers all services with `monitor: "true"` in both `dev` and `test` namespaces automatically.
+
+**File: `k8s/servicemonitor-all.yaml`**
+```yaml
+# This ONE object tells Prometheus to scrape ALL 8 services
+# in BOTH dev and test namespaces — no changes needed when adding new services
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: prometheus-demo-app
-  namespace: monitoring     # Must be in monitoring namespace
+  name: ecommerce-all-services
+  namespace: monitoring
   labels:
-    release: kube-prometheus-stack   # Must match the Helm release label
+    release: kube-prometheus-stack   # Must match your Helm release name
 spec:
+  # Watch BOTH namespaces — dev and test
   namespaceSelector:
     matchNames:
-      - demo
+      - dev
+      - test
+
+  # Only scrape services that have label: monitor="true"
   selector:
     matchLabels:
-      app: prometheus-demo-app
+      monitor: "true"
+
   endpoints:
     - port: http
       path: /metrics
       interval: 15s
+      # Add namespace and service labels to every metric
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_service_name]
+          targetLabel: service
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
 ```
+
+---
+
+### 3.5 Deploy everything
 
 ```bash
-# Deploy the app
-kubectl create namespace demo
-kubectl apply -f k8s/deployment.yaml
+# Create namespaces
+kubectl create namespace dev
+kubectl create namespace test
 
-# Verify pods are running
-kubectl get pods -n demo
-kubectl get svc -n demo
+# Deploy all 8 services to dev
+kubectl apply -f k8s/services-template.yaml -n dev
+# (repeat apply for all 8 service yamls)
 
-# Test the app
-kubectl port-forward -n demo svc/prometheus-demo-app 8080:80 &
-curl http://localhost:8080/
-curl http://localhost:8080/metrics    # See raw Prometheus metrics
+# Copy same manifests to test namespace (change APP_ENV=test)
+# kubectl apply -f k8s/services-test.yaml -n test
+
+# Apply the single ServiceMonitor (covers both namespaces)
+kubectl apply -f k8s/servicemonitor-all.yaml
+
+# Verify all 8 pods are running in dev
+kubectl get pods -n dev
+# Expected: 8 pods (2 replicas each = 16 pod instances total)
+# api-gateway-xxx          Running
+# user-service-xxx         Running
+# product-service-xxx      Running
+# order-service-xxx        Running
+# payment-service-xxx      Running
+# inventory-service-xxx    Running
+# notification-service-xxx Running
+# auth-service-xxx         Running
+
+# Verify all 8 pods are running in test
+kubectl get pods -n test
+
+# Verify Prometheus sees all targets
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090 &
+# Open: http://localhost:9090/targets
+# You should see 16 targets (8 services × 2 namespaces), all "UP"
 ```
 
-**What you should see at `/metrics`:**
+---
+
+### 3.6 Verify Prometheus is scraping all services
+
+```bash
+# Check targets via API (shows all scraped services)
+curl -s http://localhost:9090/api/v1/targets | \
+  python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for t in data['data']['activeTargets']:
+    ns  = t['labels'].get('namespace','?')
+    svc = t['labels'].get('service','?')
+    health = t['health']
+    print(f'  [{health}] namespace={ns}  service={svc}')
+" | sort
+
+# Expected output (16 lines — 8 services × 2 namespaces):
+# [up] namespace=dev   service=api-gateway
+# [up] namespace=dev   service=auth-service
+# [up] namespace=dev   service=inventory-service
+# [up] namespace=dev   service=notification-service
+# [up] namespace=dev   service=order-service
+# [up] namespace=dev   service=payment-service
+# [up] namespace=dev   service=product-service
+# [up] namespace=dev   service=user-service
+# [up] namespace=test  service=api-gateway
+# ... (same 8 for test)
+
+# ─── Useful PromQL queries for 8-service monitoring ─────────────────────────
+
+# Request rate for ALL services (grouped by service and namespace)
+sum(rate(http_requests_total[5m])) by (service, namespace)
+
+# Error rate per service (which service has most errors?)
+sum(rate(http_requests_total{status_code=~"5.."}[5m])) by (service, namespace)
+  /
+sum(rate(http_requests_total[5m])) by (service, namespace)
+* 100
+
+# P99 latency per service
+histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+
+# Compare dev vs test error rates for a specific service
+sum(rate(http_requests_total{status_code=~"5..", service="order-service"}[5m])) by (namespace)
 ```
-# HELP myapp_http_requests_total Total number of HTTP requests
-# TYPE myapp_http_requests_total counter
-myapp_http_requests_total{method="GET",route="/",status_code="200"} 5
-# HELP myapp_active_connections Number of active connections right now
-# TYPE myapp_active_connections gauge
-myapp_active_connections 0
-# HELP myapp_http_request_duration_seconds HTTP request duration in seconds
-# TYPE myapp_http_request_duration_seconds histogram
-myapp_http_request_duration_seconds_bucket{le="0.01",...} 4
-...
+
+---
+
+### 3.7 What you see at `/metrics` for any service
+
+```bash
+# Port-forward to order-service in dev
+kubectl port-forward -n dev svc/order-service 8081:80 &
+curl http://localhost:8081/metrics | grep -v "^#"
 ```
+```
+# Output (labels automatically include service="order-service", env="dev")
+http_requests_total{method="GET",route="/",status_code="200",service="order-service",env="dev"} 42
+http_requests_total{method="GET",route="/error",status_code="500",service="order-service",env="dev"} 7
+http_request_duration_seconds_bucket{le="0.1",service="order-service",env="dev",...} 38
+active_connections{service="order-service",env="dev"} 0
+process_resident_memory_bytes{service="order-service",env="dev"} 52428800
+```
+
+> **DevOps takeaway:** The `service` and `env` labels come from `register.setDefaultLabels()` in the app code (set by the `SERVICE_NAME` and `APP_ENV` env vars that **DevOps controls** via the Deployment manifest). Developers write the metrics pattern once; DevOps controls what name/environment each pod reports.
 
 ---
 
