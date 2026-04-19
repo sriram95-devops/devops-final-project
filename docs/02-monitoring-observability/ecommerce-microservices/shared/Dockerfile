@@ -1,26 +1,8 @@
-# Multi-stage Dockerfile — used for all 8 microservices.
+# Dockerfile — used for all 8 microservices.
 # Java 21 + Spring Boot 3 + Gradle 8.5
-# SERVICE_NAME and APP_ENV are injected at runtime via Kubernetes env vars — DevOps controls these.
+# Pre-built JAR (built locally via: gradle bootJar --no-daemon)
+# SERVICE_NAME and APP_ENV are injected at runtime via Kubernetes env vars.
 
-# ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM eclipse-temurin:21-jdk-alpine AS builder
-
-WORKDIR /build
-
-# Copy Gradle wrapper first (layer cache — only re-downloads if wrapper changes)
-COPY gradle/wrapper/gradle-wrapper.properties gradle/wrapper/
-COPY gradlew .
-RUN chmod +x gradlew
-
-# Copy build scripts and download dependencies (cached layer)
-COPY build.gradle settings.gradle ./
-RUN ./gradlew dependencies --no-daemon -q || true
-
-# Copy source and build the fat JAR
-COPY src ./src
-RUN ./gradlew bootJar --no-daemon -q
-
-# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM eclipse-temurin:21-jre-alpine AS runtime
 
 WORKDIR /app
@@ -28,8 +10,8 @@ WORKDIR /app
 # Security: run as non-root user
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
-# Copy only the executable JAR from the build stage
-COPY --from=builder /build/build/libs/app.jar app.jar
+# Copy the pre-built fat JAR (produced by: gradle bootJar)
+COPY build/libs/app.jar app.jar
 RUN chown appuser:appgroup app.jar
 
 USER appuser

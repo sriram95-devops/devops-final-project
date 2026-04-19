@@ -26,7 +26,7 @@ spec:
     spec:
       containers:
         - name: payment-service
-          image: REGISTRY_PLACEHOLDER/ecommerce/payment-service:v1.0
+          image: ecommersimages.azurecr.io/ecommerce/app:v1.0
           ports:
             - name: http
               containerPort: 8080
