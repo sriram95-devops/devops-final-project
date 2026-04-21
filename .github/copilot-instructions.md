@@ -1,5 +1,23 @@
 # GitHub Copilot Instructions — DevOps Mastery Repository
 
+## Copilot Agent Behaviour Rules
+
+These rules apply to every action Copilot takes when executing commands or running tasks in this repository.
+
+### Terminal Usage
+- Always use a **single persistent terminal** for all commands — do NOT open multiple terminals or switch between them.
+- **Always use shell (`bash`) commands** — use shell syntax: `&&`, `$()`, `export`, pipes `|`, etc.
+- Only fall back to PowerShell if the task **absolutely cannot** be done in shell (e.g., a Windows-only operation with no shell equivalent). In that case, add a comment explaining why.
+- Never use `execution_subagent`, `runSubagent`, or other language-based execution methods — always run commands directly via the terminal using `run_in_terminal` or `send_to_terminal`.
+- Chain sequential commands in the **same terminal session** — never open a new terminal for the next step.
+
+### Command Style
+- Use `bash` code blocks for all commands in guides and docs.
+- Use `&&` to chain commands, not `;` (so the chain stops on failure).
+- Always add a `# comment` after non-obvious commands to explain why.
+
+---
+
 ## Repository Purpose
 
 This repository is a **zero-to-expert DevOps learning project**. The goal is to take someone who knows nothing about DevOps and walk them step by step through every tool, concept, and production-grade setup needed to become an expert DevOps engineer.
