@@ -19,6 +19,19 @@ Visual guide to how the full monitoring stack works in this project — from dep
 9. [Debug Decision Tree — "Grafana Is Broken"](#9-debug-decision-tree--grafana-is-broken)
 10. [Full End-to-End Flow — Pod Crash Scenario](#10-full-end-to-end-flow--pod-crash-scenario)
 11. [Interview Diagrams](#interview-diagrams) ← simplified diagrams + what to say
+    - [Diagram 1 — How Prometheus collects metrics](#interview-diagram-1--how-does-prometheus-collect-metrics)
+    - [Diagram 2 — How Grafana connects to Prometheus](#interview-diagram-2--how-does-grafana-connect-to-prometheus)
+    - [Diagram 3 — Pod crash end-to-end flow](#interview-diagram-3--walk-me-through-what-happens-when-a-pod-crashes)
+    - [Diagram 4 — Real problems we debugged](#interview-diagram-4--what-did-you-debug-in-this-project)
+    - [Diagram 5 — Prometheus vs Grafana difference](#interview-diagram-5--what-is-the-difference-between-prometheus-and-grafana)
+    - [Diagram 6 — 4 Prometheus metric types](#interview-diagram-6--what-are-the-4-prometheus-metric-types)
+    - [Diagram 7 — Push vs Pull model](#interview-diagram-7--why-does-prometheus-pull-metrics-instead-of-apps-pushing-them)
+    - [Diagram 8 — Prometheus Operator explained](#interview-diagram-8--what-is-the-prometheus-operator-and-why-do-we-need-it)
+    - [Diagram 9 — Alertmanager: grouping, silencing, inhibition](#interview-diagram-9--how-does-alertmanager-prevent-alert-storms)
+    - [Diagram 10 — PromQL 6 key patterns](#interview-diagram-10--what-is-promql-and-show-me-some-queries)
+    - [Diagram 11 — Full component map of kube-prometheus-stack](#interview-diagram-11--explain-the-full-component-map-of-kube-prometheus-stack)
+    - [Diagram 12 — Tricky interview questions with answers](#interview-diagram-12--tricky-questions-and-short-answers)
+    - [Quick Interview Cheat Sheet](#quick-interview-cheat-sheet)
 
 ---
 
@@ -782,6 +795,473 @@ WHAT HAPPENS WHEN THINGS BREAK
 
 **Say in the interview:**
 > "Prometheus is the metrics database. It scrapes metrics from your apps on a schedule, stores them as time series data, and evaluates alert rules. Grafana is a visualization tool — it has no storage of its own. It queries Prometheus using PromQL and renders the results as graphs and dashboards. You could use Prometheus without Grafana by running queries in the Prometheus UI, but Grafana gives you much better visualizations and alerting UI. Grafana can also connect to other datasources like Elasticsearch or Loki, so in production teams often use one Grafana instance to visualize data from multiple backends."
+
+---
+
+### Interview Diagram 6 — "What are the 4 Prometheus metric types?"
+
+**What the interviewer is asking:** Do you understand the data model, not just the tool?
+
+```
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  4 Prometheus Metric Types                                       │
+  └─────────────────────────────────────────────────────────────────┘
+
+  1. COUNTER  ──── only goes UP (never down, resets to 0 on restart)
+     ┌──────────────────────────────────────────────────────────┐
+     │ http_requests_total{method="GET", status="200"} = 10432  │
+     │ http_requests_total{method="GET", status="500"} = 17     │
+     └──────────────────────────────────────────────────────────┘
+     Use for: request counts, error counts, bytes sent
+     Query:   rate(http_requests_total[5m])  ← ALWAYS wrap in rate()
+                                               never graph raw counter
+
+  2. GAUGE  ──── can go UP or DOWN (current snapshot)
+     ┌──────────────────────────────────────────────────────────┐
+     │ jvm_memory_used_bytes{area="heap"} = 134217728           │
+     │ kube_pod_status_ready{pod="product-..."} = 1             │
+     └──────────────────────────────────────────────────────────┘
+     Use for: memory usage, CPU %, queue depth, pod count
+     Query:   just use directly — avg_over_time(metric[5m]) for smoothing
+
+  3. HISTOGRAM  ──── records distribution of values in buckets
+     ┌──────────────────────────────────────────────────────────┐
+     │ http_request_duration_seconds_bucket{le="0.1"} = 2400    │
+     │ http_request_duration_seconds_bucket{le="0.5"} = 2950    │
+     │ http_request_duration_seconds_bucket{le="1.0"} = 3000    │
+     │ http_request_duration_seconds_bucket{le="+Inf"} = 3000   │
+     │ http_request_duration_seconds_sum = 450.2                │
+     │ http_request_duration_seconds_count = 3000               │
+     └──────────────────────────────────────────────────────────┘
+     Use for: request latency, response size
+     Query:   histogram_quantile(0.95, rate(..._bucket[5m]))
+              ← gives you the 95th percentile latency
+
+  4. SUMMARY  ──── pre-calculated quantiles (computed inside the app)
+     ┌──────────────────────────────────────────────────────────┐
+     │ rpc_duration_seconds{quantile="0.5"}  = 0.012            │
+     │ rpc_duration_seconds{quantile="0.95"} = 0.043            │
+     └──────────────────────────────────────────────────────────┘
+     Use for: when you need exact quantiles at the app level
+     Difference vs Histogram: cannot aggregate across instances
+```
+
+**Say in the interview:**
+> "There are four metric types. Counters only go up and are used for things like request counts — you always wrap them in `rate()` to get a per-second rate. Gauges are current values that can go up or down, like memory usage or replica count. Histograms record the distribution of values in configurable buckets — you use `histogram_quantile()` to get percentile latencies like p95 or p99. Summaries are similar but the quantiles are calculated inside the app, which means you cannot aggregate them across multiple instances. In Kubernetes monitoring we mainly use counters and gauges from kube-state-metrics, and histograms from app-level latency metrics."
+
+---
+
+### Interview Diagram 7 — "Why does Prometheus pull metrics instead of apps pushing them?"
+
+**What the interviewer is asking:** Do you understand the architectural decision?
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Push vs Pull — why Prometheus chose pull                         │
+  └──────────────────────────────────────────────────────────────────┘
+
+  PUSH model (e.g. StatsD, InfluxDB telegraf)
+  ┌──────────┐   metrics   ┌─────────────┐
+  │  App     │────────────►│  Metrics DB │
+  └──────────┘             └─────────────┘
+  Problem: You have 50 services. If the metrics DB is down,
+           all 50 apps pile up data or drop it.
+           You also have no way to know if an app STOPPED
+           sending — silence looks the same as "all good".
+
+  ─────────────────────────────────────────────────────────────────
+
+  PULL model (Prometheus)
+  ┌──────────┐   GET /metrics  ┌─────────────┐
+  │  App     │◄────────────────│  Prometheus │
+  └──────────┘  every 15s      └─────────────┘
+  Benefits:
+  ✅ Prometheus controls the scrape rate (not the app)
+  ✅ If the app stops responding → up=0 → you know immediately
+  ✅ Apps do not need to know Prometheus's address
+  ✅ Easy to test: curl localhost:8080/actuator/prometheus
+  ✅ Prometheus can scrape the same app from multiple instances
+
+  When you DO need push: use Pushgateway
+  ┌──────────────────┐   push   ┌─────────────────┐
+  │  Batch job       │─────────►│   Pushgateway   │◄── Prometheus scrapes
+  │  (runs and exits)│          └─────────────────┘
+  └──────────────────┘
+  Use Pushgateway for short-lived jobs that finish before
+  Prometheus can scrape them (CI jobs, cron jobs).
+```
+
+**Say in the interview:**
+> "Prometheus uses a pull model — it goes out to each app and requests metrics. This has several advantages. If an app stops responding, Prometheus immediately knows because `up` becomes 0. With a push model, silence is ambiguous — you can't tell if the app is healthy and just hasn't sent anything yet, or if it's dead. The pull model also means apps don't need to know where Prometheus is. The one exception is short-lived batch jobs that finish before Prometheus can scrape them — for those we use the Pushgateway as an intermediary."
+
+---
+
+### Interview Diagram 8 — "What is the Prometheus Operator and why do we need it?"
+
+**What the interviewer is asking:** Do you know the difference between Prometheus and the Operator?
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Without Operator vs With Operator                                │
+  └──────────────────────────────────────────────────────────────────┘
+
+  WITHOUT Prometheus Operator
+  ────────────────────────────
+  You manage Prometheus config manually:
+
+  prometheus.yml:
+    scrape_configs:
+      - job_name: product-service
+        static_configs:
+          - targets: ['10.244.0.5:8080']   ← hardcoded pod IP
+                                              breaks when pod restarts
+      - job_name: order-service
+        static_configs:
+          - targets: ['10.244.0.6:8080']   ← you must update this
+                                              every time a pod changes
+
+  Every new service = manually edit prometheus.yml + restart Prometheus
+
+
+  WITH Prometheus Operator
+  ────────────────────────
+  You deploy a CRD (ServiceMonitor):
+
+  ServiceMonitor YAML:
+    selector:
+      matchLabels:
+        monitor: "true"        ← finds services automatically
+    namespaces: [dev, test]    ← by label, not hardcoded IP
+
+  Operator watches for ServiceMonitor objects
+       │
+       ▼
+  Operator auto-generates prometheus.yml scrape config
+       │
+       ▼
+  Prometheus reloads config automatically (no restart needed)
+       │
+       ▼
+  New service deployed? Just add monitor=true label → auto-discovered
+
+
+  What the Operator manages automatically:
+  ┌───────────────────────────────────────────┐
+  │  ServiceMonitor  → scrape targets         │
+  │  PodMonitor      → scrape pods directly   │
+  │  PrometheusRule  → alert rules            │
+  │  AlertManager    → alertmanager config    │
+  └───────────────────────────────────────────┘
+```
+
+**Say in the interview:**
+> "The Prometheus Operator is a Kubernetes controller that manages Prometheus configuration automatically. Without it, you have to manually write static scrape configs with hardcoded pod IPs, which breaks every time a pod restarts. The Operator introduces CRDs like ServiceMonitor and PrometheusRule. You define a ServiceMonitor that says 'scrape all services with this label in these namespaces', and the Operator watches for those objects and automatically generates and reloads the Prometheus configuration. This means adding a new microservice to monitoring is just adding a label to its Service — no manual Prometheus config editing needed."
+
+---
+
+### Interview Diagram 9 — "How does Alertmanager prevent alert storms?"
+
+**What the interviewer is asking:** Do you know grouping, silencing, and inhibition?
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Alertmanager — 3 mechanisms to prevent noise                    │
+  └──────────────────────────────────────────────────────────────────┘
+
+  Scenario: Node goes down. 10 pods crash. 10 alerts fire at once.
+
+  ─────────────────────────────────────────────────────────────────
+
+  1. GROUPING — combine related alerts into one notification
+     ┌────────────────────────────────────────────────────────┐
+     │ 10 PodCrashLooping alerts → grouped by namespace       │
+     │                          → sent as ONE Slack message   │
+     │ "10 pods are crash-looping in namespace: dev"          │
+     └────────────────────────────────────────────────────────┘
+     Config: group_by: [namespace, alertname]
+     Without grouping: 10 separate Slack messages → noise
+
+  2. INHIBITION — suppress child alerts when parent fires
+     ┌────────────────────────────────────────────────────────┐
+     │ NodeDown alert fires (severity=critical)               │
+     │       │                                                │
+     │       └── suppresses all PodCrashLooping alerts        │
+     │           on that same node                            │
+     │                                                        │
+     │ Reason: If the node is down, pods will crash — but     │
+     │ the ROOT CAUSE is the node. No need to alert for each  │
+     │ pod separately. Fix the node → pods fix themselves.    │
+     └────────────────────────────────────────────────────────┘
+     Config: inhibit_rules: source_match / target_match
+
+  3. SILENCING — temporary mute during maintenance
+     ┌────────────────────────────────────────────────────────┐
+     │ "We are upgrading product-service for 30 minutes"      │
+     │       │                                                │
+     │       └── create silence: namespace=dev,               │
+     │           app=product-service, duration=30m            │
+     │                                                        │
+     │ All alerts matching those labels are muted until the   │
+     │ silence expires — no pages during planned maintenance  │
+     └────────────────────────────────────────────────────────┘
+     Set via Alertmanager UI or amtool CLI
+
+  ─────────────────────────────────────────────────────────────────
+  Alert flow with all 3 mechanisms:
+
+  Prometheus ──► Alertmanager
+                    │
+                    ├── Is this alert inhibited? → suppress it
+                    ├── Is there an active silence? → suppress it
+                    ├── Group with other similar alerts
+                    ├── Wait group_wait (30s) for more alerts to join
+                    └── Send ONE grouped notification to receiver
+```
+
+**Say in the interview:**
+> "Alertmanager has three features to prevent alert storms. Grouping combines multiple alerts with the same labels into a single notification — so if 10 pods crash at once you get one Slack message, not ten. Inhibition lets you suppress lower-priority alerts when a higher-priority root-cause alert is already firing — for example, if a node is down, you suppress all the pod crash alerts on that node because the root cause is the node itself. Silencing lets you mute alerts temporarily during planned maintenance so on-call engineers aren't paged while you're doing a scheduled upgrade."
+
+---
+
+### Interview Diagram 10 — "What is PromQL and show me some queries"
+
+**What the interviewer is asking:** Can you actually write queries, not just run them?
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  PromQL — 6 most important patterns                              │
+  └──────────────────────────────────────────────────────────────────┘
+
+  A metric looks like this:
+  metric_name{label1="value1", label2="value2"} <number> <timestamp>
+
+  Example:
+  http_requests_total{method="GET", namespace="dev", status="200"} 10432
+
+  ─────────────────────────────────────────────────────────────────
+
+  Pattern 1: Is my service UP?
+  ──────────────────────────────
+  up{namespace="dev"}
+  → Returns 1 for each target that is being scraped successfully
+  → Returns 0 for each target that is down
+  → If a service is missing entirely: absent(up{job="product-service"})
+
+  Pattern 2: Request rate (requests per second)
+  ──────────────────────────────────────────────
+  rate(http_requests_total{namespace="dev"}[5m])
+  → [5m] = look at the last 5 minutes of data
+  → rate() = calculate per-second average over that window
+  → Use this for: traffic graphs, SLO calculations
+
+  Pattern 3: Error rate percentage
+  ──────────────────────────────────
+  rate(http_requests_total{status=~"5.."}[5m])
+  /
+  rate(http_requests_total[5m])
+  * 100
+  → status=~"5.." = regex match for 500, 502, 503, etc.
+  → Divides error requests by total requests
+  → Result: % of requests that are errors
+
+  Pattern 4: p95 latency (95th percentile response time)
+  ────────────────────────────────────────────────────────
+  histogram_quantile(
+    0.95,
+    rate(http_request_duration_seconds_bucket{namespace="dev"}[5m])
+  )
+  → "95% of requests are faster than X seconds"
+  → Change 0.95 to 0.99 for p99 (useful for SLA reporting)
+
+  Pattern 5: Pod restarts in last 15 minutes
+  ───────────────────────────────────────────
+  increase(kube_pod_container_status_restarts_total{namespace="dev"}[15m])
+  → increase() = total increase over the time window (not per-second)
+  → Use for: crash detection, alert rules
+
+  Pattern 6: Memory usage percentage
+  ─────────────────────────────────────
+  (
+    container_memory_working_set_bytes{namespace="dev"}
+    /
+    container_spec_memory_limit_bytes{namespace="dev"}
+  ) * 100
+  → How much of the memory LIMIT is the container using?
+  → Alert if this goes above 80%
+```
+
+**Say in the interview:**
+> "PromQL has a few key patterns. For service health, I use `up{namespace='dev'}` — returns 1 if Prometheus can scrape the target, 0 if not. For traffic, I use `rate()` on counters like `http_requests_total` to get requests per second. For error rate, I divide the rate of 5xx errors by the rate of all requests and multiply by 100. For latency, I use `histogram_quantile(0.95, ...)` to get the 95th percentile response time. For crash detection I use `increase()` on the restart counter — the key difference between `rate()` and `increase()` is that `rate()` gives you per-second, `increase()` gives you the total change over the window."
+
+---
+
+### Interview Diagram 11 — "Explain the full component map of kube-prometheus-stack"
+
+**What the interviewer is asking:** Can you name all the pieces and what each one does?
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  kube-prometheus-stack — what each component does               │
+  └──────────────────────────────────────────────────────────────────┘
+
+  Helm chart: kube-prometheus-stack
+  (installs everything below in one command)
+         │
+         ├── Prometheus Operator
+         │     Watches CRDs (ServiceMonitor, PrometheusRule, etc.)
+         │     Generates and reloads Prometheus config automatically
+         │     You never edit prometheus.yml directly
+         │
+         ├── Prometheus
+         │     Scrapes metrics from all discovered targets
+         │     Stores time series data in TSDB (on disk, 15 days default)
+         │     Evaluates alert rules every 1 minute
+         │     Fires alerts to Alertmanager
+         │
+         ├── Alertmanager
+         │     Receives alerts from Prometheus
+         │     Groups, inhibits, silences alerts
+         │     Routes to receivers (Slack, PagerDuty, email)
+         │
+         ├── Grafana
+         │     Visualization UI
+         │     Queries Prometheus via PromQL
+         │     Shows dashboards, panels, graphs
+         │     Also has its own alerting UI (separate from Alertmanager)
+         │
+         ├── kube-state-metrics
+         │     Talks to the Kubernetes API server
+         │     Exposes cluster STATE as Prometheus metrics:
+         │       - How many pods are running per deployment?
+         │       - How many restarts?
+         │       - Are nodes ready?
+         │       - What are the resource requests/limits?
+         │
+         └── node-exporter
+               Runs as a DaemonSet (one pod per node)
+               Exposes NODE-LEVEL metrics:
+                 - CPU usage
+                 - Memory usage
+                 - Disk I/O
+                 - Network throughput
+               Does NOT know about pods or Kubernetes — OS level only
+
+  ─────────────────────────────────────────────────────────────────
+
+  The difference between kube-state-metrics and node-exporter:
+
+  node-exporter           kube-state-metrics
+  ─────────────────       ─────────────────────
+  "Is the machine OK?"    "Is the cluster OK?"
+  CPU: 78%                Deployment replicas: 2/2
+  Memory: 4.2GB used      Pod restarts: 5
+  Disk: 42% full          Node ready: true
+  Network: 1.2 Gbps       Resource limits set: yes/no
+```
+
+**Say in the interview:**
+> "kube-prometheus-stack is a Helm chart that bundles six components. The Prometheus Operator manages configuration automatically via CRDs. Prometheus itself scrapes metrics and stores them. Alertmanager receives alerts from Prometheus and routes them to the right destination. Grafana is the visualization layer. kube-state-metrics talks to the Kubernetes API and exposes cluster state as metrics — things like deployment replica counts and pod restart counts. node-exporter runs on every node as a DaemonSet and exposes the underlying machine metrics like CPU, memory, and disk. The key difference between kube-state-metrics and node-exporter is: kube-state-metrics tells you about Kubernetes objects, node-exporter tells you about the physical or virtual machine underneath."
+
+---
+
+### Interview Diagram 12 — "Tricky questions and short answers"
+
+These are questions interviewers use to test depth. These are one-line answers.
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Tricky Questions → Short Correct Answers                        │
+  └──────────────────────────────────────────────────────────────────┘
+
+  Q: If I scale a deployment to 0, does Prometheus show up=0?
+  A: NO. The target disappears completely. up=0 only fires when
+     Prometheus can reach the pod but the scrape fails.
+     Scale-to-0 removes the endpoint → no target to scrape at all.
+     Use absent() to detect this: absent(up{job="product-service"})
+
+  ─────────────────────────────────────────────────────────────────
+
+  Q: What is the difference between up=0 and absent(up)?
+  A: up=0 means the target exists but is not responding (pod is there,
+     app is broken). absent() returns 1 when the metric has NO data
+     at all (pod is gone, service deleted, scaled to 0).
+
+  ─────────────────────────────────────────────────────────────────
+
+  Q: Can Prometheus scrape metrics from a pod without a Service?
+  A: Yes, using a PodMonitor CRD instead of ServiceMonitor.
+     ServiceMonitor discovers via Service → Endpoints.
+     PodMonitor discovers pods directly by label.
+     Use PodMonitor when your app does not need a Service.
+
+  ─────────────────────────────────────────────────────────────────
+
+  Q: Why do we use rate() and not irate()?
+  A: rate() calculates the average per-second rate over the whole
+     window [5m]. irate() uses only the last two data points —
+     it is more sensitive to spikes but noisier on graphs.
+     Use rate() for dashboards and alerts, irate() for debugging spikes.
+
+  ─────────────────────────────────────────────────────────────────
+
+  Q: What happens if Prometheus goes down? Is data lost?
+  A: Any metrics that were not scraped during the downtime are lost —
+     Prometheus cannot backfill. Data already stored in TSDB on disk
+     is safe. For production, use Thanos or Cortex for HA and long-term
+     storage. On this project we used single-instance Prometheus
+     (Minikube, not production).
+
+  ─────────────────────────────────────────────────────────────────
+
+  Q: Grafana shows "No data" but targets show UP=1 in Prometheus.
+     What is wrong?
+  A: The PromQL query in the Grafana panel has wrong label filters.
+     For example the panel uses namespace="default" but your pods
+     are in namespace="dev". Click Edit on the panel and fix the
+     label values to match your actual namespace.
+
+  ─────────────────────────────────────────────────────────────────
+
+  Q: What is the difference between a liveness probe and a
+     readiness probe?
+  A: Liveness probe: "Is the app alive?" — if it fails, kubelet
+     KILLS and RESTARTS the container. This causes CrashLoopBackOff.
+     Readiness probe: "Is the app ready to receive traffic?" — if it
+     fails, the pod is REMOVED from the Service Endpoints (no traffic
+     sent to it) but NOT restarted. Prometheus uses the Endpoints list
+     to discover scrape targets, so a failing readiness probe will
+     remove the pod from Prometheus targets too.
+
+  ─────────────────────────────────────────────────────────────────
+
+  Q: How do you add a new microservice to monitoring without
+     editing the ServiceMonitor?
+  A: Just add the label monitor="true" to its Kubernetes Service.
+     The ServiceMonitor's selector.matchLabels picks it up automatically.
+     Prometheus Operator detects the new endpoint and adds it to
+     the scrape config within one scrape interval (15 seconds).
+
+  ─────────────────────────────────────────────────────────────────
+
+  Q: What is TSDB retention and how do you change it?
+  A: TSDB retention is how long Prometheus keeps historical data on disk.
+     Default is 15 days. After that, old data is deleted automatically.
+     Change it in Helm values:
+       prometheus.prometheusSpec.retention: 30d
+     For longer retention (months/years) use remote_write to Thanos,
+     Cortex, or Mimir — they are designed for long-term metric storage.
+
+  ─────────────────────────────────────────────────────────────────
+
+  Q: Why do we use helm upgrade instead of helm install when
+     making changes?
+  A: helm install creates a new release. helm upgrade updates an
+     existing release — it compares your new values against the
+     current state and only changes what is different. It also keeps
+     the release history so you can rollback with helm rollback.
+     Every helm upgrade increments the revision number.
+     In this project we went from revision 1 → 2 → 3 to fix issues.
+```
 
 ---
 
