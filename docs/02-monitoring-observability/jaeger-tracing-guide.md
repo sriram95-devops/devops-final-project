@@ -142,33 +142,33 @@ spec:
       labels:
         app: jaeger
       annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "14269"
+        prometheus.io/scrape: "true"    # ← PROMETHEUS: scrape Jaeger's own metrics
+        prometheus.io/port: "14269"     # ← PROMETHEUS: Jaeger admin/metrics port
     spec:
       containers:
         - name: jaeger
           image: jaegertracing/all-in-one:1.53
           args:
-            - "--memory.max-traces=50000"   # Keep last 50k traces in memory
-            - "--query.base-path=/jaeger"   # Optional URL prefix
+            - "--memory.max-traces=50000"
+            - "--query.base-path=/jaeger"
           env:
             - name: COLLECTOR_OTLP_ENABLED
-              value: "true"                 # Enable OpenTelemetry protocol
+              value: "true"             # ← JAEGER: enables OTLP receiver (ports 4317/4318) — required for Spring Boot/OTel apps
             - name: SPAN_STORAGE_TYPE
-              value: "memory"
+              value: "memory"           # ← JAEGER: storage backend — use "elasticsearch" for production
           ports:
-            - containerPort: 5775           # UDP agent: Zipkin compact thrift
+            - containerPort: 6831       # ← JAEGER: UDP — apps send spans here via Jaeger agent protocol
               protocol: UDP
-            - containerPort: 6831           # UDP agent: Jaeger compact thrift
+            - containerPort: 16686      # ← JAEGER: UI — access the trace viewer on this port
+            - containerPort: 14268      # ← JAEGER: HTTP collector — apps can POST spans directly here
+            - containerPort: 14269      # ← JAEGER: admin/health/metrics port
+            - containerPort: 4317       # ← JAEGER/OTLP: gRPC receiver — used by OTel SDK exporters
+            - containerPort: 4318       # ← JAEGER/OTLP: HTTP receiver — used by Spring Boot micrometer-tracing
+            - containerPort: 5775
               protocol: UDP
-            - containerPort: 6832           # UDP agent: Jaeger binary thrift
+            - containerPort: 6832
               protocol: UDP
-            - containerPort: 5778           # HTTP config server
-            - containerPort: 16686          # Jaeger UI
-            - containerPort: 14268          # HTTP collector: accept jaeger.thrift
-            - containerPort: 14269          # Admin port: health check, metrics
-            - containerPort: 4317           # OTLP gRPC receiver
-            - containerPort: 4318           # OTLP HTTP receiver
+            - containerPort: 5778
           resources:
             requests:
               memory: 256Mi
@@ -198,22 +198,22 @@ spec:
   selector:
     app: jaeger
   ports:
+    - name: otlp-http              # ← JAEGER: apps in other namespaces send traces to this port
+      port: 4318
+      targetPort: 4318
+    - name: otlp-grpc              # ← JAEGER: gRPC alternative for OTel exporters
+      port: 4317
+      targetPort: 4317
+    - name: query-http             # ← JAEGER: UI and API — port-forward this to access the UI
+      port: 16686
+      targetPort: 16686
+    - name: collector-http         # ← JAEGER: direct span submission over HTTP
+      port: 14268
+      targetPort: 14268
     - name: agent-compact-thrift
       port: 6831
       protocol: UDP
       targetPort: 6831
-    - name: collector-http
-      port: 14268
-      targetPort: 14268
-    - name: query-http
-      port: 16686
-      targetPort: 16686
-    - name: otlp-grpc
-      port: 4317
-      targetPort: 4317
-    - name: otlp-http
-      port: 4318
-      targetPort: 4318
     - name: admin
       port: 14269
       targetPort: 14269
@@ -230,7 +230,29 @@ kubectl port-forward -n tracing svc/jaeger-all-in-one 16686:16686 &
 echo "Jaeger UI: http://localhost:16686"
 ```
 
-### Option B: Jaeger Operator (Production Setup)
+**What DevOps MUST configure for Jaeger — the mandatory lines in the YAML above:**
+
+| Line | Where | Why it is needed |
+|---|---|---|
+| `COLLECTOR_OTLP_ENABLED: "true"` | Deployment → `env` | Activates the OTLP receiver (ports 4317/4318) — required for Spring Boot and OTel SDK apps |
+| `SPAN_STORAGE_TYPE: "memory"` | Deployment → `env` | Sets the storage backend — change to `elasticsearch` for production |
+| `containerPort: 4318` | Deployment → `ports` | Apps push traces to Jaeger on this port via OTLP HTTP |
+| `containerPort: 16686` | Deployment → `ports` | Jaeger UI — port-forward this to view traces |
+| `port: 4318 / otlp-http` | Service → `ports` | Exposes the OTLP receiver so apps in the `dev` namespace can reach it across namespaces |
+| `port: 16686 / query-http` | Service → `ports` | Exposes the UI/API for port-forwarding |
+
+**App-side configuration DevOps injects via Deployment env vars (no code change needed):**
+
+```yaml
+# Add these to every app Deployment in the dev namespace
+env:
+  - name: MANAGEMENT_OTLP_TRACING_ENDPOINT
+    value: "http://jaeger.observability.svc.cluster.local:4318/v1/traces"  # ← JAEGER: OTLP HTTP endpoint
+  - name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY
+    value: "1.0"   # ← JAEGER: 1.0 = 100% in dev; use 0.1 (10%) in production
+```
+
+The app pushes traces TO Jaeger — Jaeger does not pull from the app. No service exposure needed on the app side.
 
 The Jaeger Operator manages Jaeger deployments with different deployment strategies.
 
@@ -1054,6 +1076,107 @@ EOF
 # Check Elasticsearch indices
 curl -s "http://localhost:9200/_cat/indices/jaeger*?v" \
   -u "elastic:$ES_PASSWORD"
+```
+
+### Issue 6: `services "jaeger-query" not found` When Port-Forwarding
+
+**Symptoms:** Running `kubectl port-forward svc/jaeger-query -n observability 16686:16686` returns:
+```
+Error from server (NotFound): services "jaeger-query" not found
+```
+
+**Root Cause:** When Jaeger is installed via `helm install jaeger jaegertracing/jaeger`, the all-in-one chart creates a single service named `jaeger`, **not** `jaeger-query`. The service name `jaeger-query` only exists when using the Jaeger Operator or a split-component chart.
+
+**Fix:**
+```bash
+# Step 1: Find the actual service name
+kubectl get svc -n observability
+
+# You will see something like:
+# NAME     TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)    AGE
+# jaeger   ClusterIP   10.104.124.199   <none>        16686/TCP  ...
+
+# Step 2: Use the correct service name
+kubectl port-forward svc/jaeger -n observability 16686:16686
+
+# Then open: http://localhost:16686
+```
+
+---
+
+### Issue 7: Application Has No Jaeger/OTel Config — No Traces Appearing
+
+**Symptoms:** Jaeger UI shows no services at all even after the app is running and receiving traffic.
+
+**Root Cause:** The application was built without any OpenTelemetry SDK or Jaeger client library. Adding environment variables alone (`JAEGER_AGENT_HOST`, etc.) does nothing if the app code does not have the SDK loaded. You must:
+1. Add the OTel SDK dependency to the app's build file
+2. Configure the OTLP exporter endpoint in `application.properties`
+3. Rebuild the Docker image and redeploy
+
+**Fix for Spring Boot 3 apps (Gradle):**
+
+```groovy
+// Add to build.gradle dependencies block
+implementation 'io.micrometer:micrometer-tracing-bridge-otel'   // OTel bridge
+implementation 'io.opentelemetry:opentelemetry-exporter-otlp'   // OTLP exporter
+```
+
+```properties
+# Add to application.properties
+management.tracing.sampling.probability=1.0
+management.otlp.tracing.endpoint=http://jaeger.observability.svc.cluster.local:4318/v1/traces
+logging.pattern.correlation=[%X{traceId}/%X{spanId}]
+```
+
+```bash
+# Rebuild the JAR and Docker image, then push
+export JAVA_HOME=/path/to/jdk   # Fix JAVA_HOME if gradle fails
+gradle bootJar --no-daemon
+
+docker build -t yourrepo/api-gateway:v1.1 .
+docker push yourrepo/api-gateway:v1.1
+
+# Roll out to Kubernetes
+kubectl set image deployment/api-gateway api-gateway=yourrepo/api-gateway:v1.1 -n dev
+kubectl rollout status deployment/api-gateway -n dev
+```
+
+**Verify it is working:**
+```bash
+# Check that the OTel libs are present in the running pod's classpath
+kubectl exec -n dev <pod-name> -- find /app -name "opentelemetry*.jar" 2>/dev/null
+
+# Generate traffic then check Jaeger
+curl http://localhost:8080/api/data
+curl http://localhost:16686/api/services   # Should now list your service
+```
+
+---
+
+
+### Issue 8: `Service api-gateway does not have a service port 8080`
+
+**Symptoms:** Running `kubectl port-forward svc/api-gateway -n dev 8080:8080` returns:
+```
+error: Service api-gateway does not have a service port 8080
+```
+
+**Root Cause:** The Kubernetes Service exposes port `80` (standard HTTP), but the application container listens internally on `8080`. The Service maps `80 → 8080` via `targetPort`. Port-forward uses the **Service port** (80), not the container port.
+
+**Fix:**
+```bash
+# Step 1: Check the actual service port
+kubectl get svc -n dev
+# NAME          TYPE        CLUSTER-IP   PORT(S)
+# api-gateway   ClusterIP   10.x.x.x    80/TCP     <-- Service port is 80
+
+# Step 2: Use the correct port mapping: local-port:service-port
+kubectl port-forward svc/api-gateway -n dev 8080:80
+#                                            ^^^^  ^^
+#                                            |     Service port (80)
+#                                            Local port (your machine)
+
+# Now access at: http://localhost:8080
 ```
 
 ---

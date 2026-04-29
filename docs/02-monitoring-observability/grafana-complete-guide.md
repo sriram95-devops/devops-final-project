@@ -356,44 +356,42 @@ az grafana assign-role \
 
 apiVersion: 1
 
-# Delete datasources that are no longer in this config
 deleteDatasources:
   - name: OldDatasource
     orgId: 1
 
 datasources:
-  # Primary: Prometheus for metrics
-  - name: Prometheus
-    type: prometheus
-    access: proxy             # 'proxy' = Grafana server proxies request; 'direct' = browser sends request
-    url: http://prometheus-stack-kube-prom-prometheus:9090
-    isDefault: true
-    editable: false           # Prevent UI modifications
-    uid: prometheus           # Fixed UID for dashboard references
+  # ── Prometheus datasource ─────────────────────────────────────────────
+  - name: Prometheus                                          # ← GRAFANA: display name shown in UI
+    type: prometheus                                          # ← GRAFANA: must be exactly "prometheus"
+    access: proxy
+    url: http://prometheus-stack-kube-prom-prometheus:9090    # ← GRAFANA: Prometheus service URL inside cluster
+    isDefault: true                                           # ← GRAFANA: makes this the default datasource
+    editable: false
+    uid: prometheus                                           # ← GRAFANA: fixed UID used by dashboards to reference this source
     jsonData:
-      timeInterval: "15s"     # Must match Prometheus scrape_interval
+      timeInterval: "15s"                                     # ← GRAFANA: must match Prometheus scrape_interval
       queryTimeout: "60s"
-      httpMethod: POST        # POST is more efficient for long queries
-      manageAlerts: true      # Let Grafana manage alerts from Prometheus
+      httpMethod: POST
+      manageAlerts: true
       prometheusType: Prometheus
       prometheusVersion: "2.47.0"
       incrementalQuerying: true
-      # Exemplar support - links metrics to traces
-      exemplarTraceIdDestinations:
+      exemplarTraceIdDestinations:                            # ← GRAFANA+JAEGER: links Prometheus exemplars to Jaeger traces
         - name: traceID
-          datasourceUid: jaeger
+          datasourceUid: jaeger                               # ← GRAFANA: must match the uid of the Jaeger datasource below
           urlDisplayLabel: "View trace"
 
-  # Elasticsearch for log correlation
-  - name: Elasticsearch
-    type: elasticsearch
+  # ── Elasticsearch datasource ──────────────────────────────────────────
+  - name: Elasticsearch                                       # ← GRAFANA: display name shown in UI
+    type: elasticsearch                                       # ← GRAFANA: must be exactly "elasticsearch"
     access: proxy
-    url: http://elasticsearch-es-http.elastic.svc.cluster.local:9200
-    uid: elasticsearch
+    url: http://elasticsearch-es-http.elastic.svc.cluster.local:9200  # ← GRAFANA: Elasticsearch service URL
+    uid: elasticsearch                                        # ← GRAFANA: fixed UID used by dashboards
     editable: false
     jsonData:
-      index: "logstash-*"
-      timeField: "@timestamp"
+      index: "logstash-*"                                     # ← GRAFANA: index pattern to query
+      timeField: "@timestamp"                                 # ← GRAFANA: field used for time filtering
       esVersion: "8.0.0"
       maxConcurrentShardRequests: 5
       logLevelField: "level"
@@ -405,23 +403,23 @@ datasources:
     # basicAuth: true
     # basicAuthUser: elastic
 
-  # Jaeger for distributed tracing
-  - name: Jaeger
-    type: jaeger
+  # ── Jaeger datasource ─────────────────────────────────────────────────
+  - name: Jaeger                                              # ← GRAFANA: display name shown in UI
+    type: jaeger                                              # ← GRAFANA: must be exactly "jaeger"
     access: proxy
-    url: http://jaeger-query.tracing.svc.cluster.local:16686
-    uid: jaeger
+    url: http://jaeger-query.tracing.svc.cluster.local:16686  # ← GRAFANA: Jaeger query service URL
+    uid: jaeger                                               # ← GRAFANA: fixed UID — must match what Prometheus datasource references
     editable: false
     jsonData:
       tracesToLogsV2:
-        datasourceUid: elasticsearch
+        datasourceUid: elasticsearch                          # ← GRAFANA: links traces to logs in Elasticsearch
         filterByTraceID: true
         filterBySpanID: false
         tags:
           - key: "k8s.pod.name"
             value: "kubernetes_pod_name"
       tracesToMetrics:
-        datasourceUid: prometheus
+        datasourceUid: prometheus                             # ← GRAFANA: links traces back to Prometheus metrics
         tags:
           - key: "service.name"
             value: "job"
@@ -430,26 +428,42 @@ datasources:
       nodeGraph:
         enabled: true
 
-  # Loki for logs (if using Loki instead of ELK)
-  - name: Loki
-    type: loki
+  # ── Loki datasource ────────────────────────────────────────────────────────
+  - name: Loki                                                # ← GRAFANA: display name shown in UI
+    type: loki                                                # ← GRAFANA: must be exactly "loki"
     access: proxy
-    url: http://loki-gateway.monitoring.svc.cluster.local:80
-    uid: loki
+    url: http://loki-gateway.monitoring.svc.cluster.local:80  # ← GRAFANA: Loki service URL inside cluster
+    uid: loki                                                 # ← GRAFANA: fixed UID — must match what Jaeger datasource references
     editable: false
     jsonData:
       derivedFields:
-        - datasourceUid: jaeger
-          matcherRegex: "traceID=(\\w+)"
+        - datasourceUid: jaeger                               # ← GRAFANA: links log lines to Jaeger traces
+          matcherRegex: "traceID=(\\w+)"                      # ← GRAFANA: regex to extract trace ID from log lines
           name: TraceID
           url: "$${__value.raw}"
           urlDisplayLabel: "View Trace in Jaeger"
       maxLines: 1000
 ```
 
-### 4.2 Dashboard JSON Structure
+**What DevOps MUST configure for Grafana datasources — the mandatory lines (out of the full YAML above):**
 
-Grafana dashboards are stored as JSON. Understanding the structure allows you to create and version-control dashboards as code.
+| Line | Datasource | Why it is needed |
+|---|---|---|
+| `type: prometheus` | Prometheus | Tells Grafana which plugin to use — must match exactly |
+| `url: http://prometheus-stack-...:9090` | Prometheus | Where Grafana sends PromQL queries |
+| `isDefault: true` | Prometheus | Makes this the pre-selected datasource in dashboards |
+| `uid: prometheus` | Prometheus | Stable ID referenced by all dashboard JSON files |
+| `timeInterval: "15s"` | Prometheus | Must match your Prometheus scrape interval or graphs show gaps |
+| `exemplarTraceIdDestinations.datasourceUid: jaeger` | Prometheus | Links Prometheus metric exemplars to Jaeger traces |
+| `type: elasticsearch` | Elasticsearch | Plugin type — must match exactly |
+| `index: "logstash-*"` | Elasticsearch | Index pattern to search logs in |
+| `timeField: "@timestamp"` | Elasticsearch | Field used for time-range filtering |
+| `type: jaeger` | Jaeger | Plugin type — must match exactly |
+| `url: http://jaeger-query...:16686` | Jaeger | Where Grafana fetches trace data from |
+| `uid: jaeger` | Jaeger | Must match the `datasourceUid: jaeger` reference in Prometheus and Loki configs |
+| `matcherRegex: "traceID=(\\w+)"` | Loki | Pattern that extracts a trace ID from a log line — enables "jump to trace" from logs |
+
+Everything else (editable, maxLines, httpMethod) is tuning — not required for the tool to work.
 
 ```json
 {

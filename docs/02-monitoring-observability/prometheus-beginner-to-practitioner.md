@@ -314,7 +314,7 @@ metadata:
   labels:
     app: api-gateway
     team: platform
-    monitored-by: prometheus   # custom label for grouping in Grafana
+    monitored-by: prometheus
 spec:
   replicas: 2
   selector:
@@ -326,10 +326,9 @@ spec:
         app: api-gateway
         team: platform
       annotations:
-        # ── DevOps adds these 3 lines — this is ALL you need for Prometheus ──
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
-        prometheus.io/path: "/metrics"
+        prometheus.io/scrape: "true"          # ← PROMETHEUS: must be "true" to enable scraping
+        prometheus.io/port: "8080"            # ← PROMETHEUS: port where /metrics is exposed
+        prometheus.io/path: "/metrics"        # ← PROMETHEUS: path Prometheus will call
     spec:
       containers:
         - name: api-gateway
@@ -337,7 +336,7 @@ spec:
           ports:
             - containerPort: 8080
           env:
-            - name: SERVICE_NAME         # DevOps sets this — no code change
+            - name: SERVICE_NAME
               value: "api-gateway"
             - name: APP_ENV
               value: "dev"
@@ -360,18 +359,18 @@ metadata:
   namespace: dev
   labels:
     app: api-gateway
-    monitor: "true"          # used by ServiceMonitor selector below
+    monitor: "true"           # ← PROMETHEUS: ServiceMonitor uses this label to find the service
 spec:
   selector:
     app: api-gateway
   ports:
-    - name: http
+    - name: http              # ← PROMETHEUS: ServiceMonitor references this port by name "http"
       port: 80
       targetPort: 8080
   type: ClusterIP
 ---
 # ════════════════════════════════════════════════════════════
-# 2. order-service  (dev namespace)
+# 2. order-service  (dev namespace)  — same pattern for all 8 services
 # ════════════════════════════════════════════════════════════
 apiVersion: apps/v1
 kind: Deployment
@@ -393,9 +392,9 @@ spec:
         app: order-service
         team: orders
       annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
-        prometheus.io/path: "/metrics"
+        prometheus.io/scrape: "true"          # ← PROMETHEUS: must be "true" to enable scraping
+        prometheus.io/port: "8080"            # ← PROMETHEUS: port where /metrics is exposed
+        prometheus.io/path: "/metrics"        # ← PROMETHEUS: path Prometheus will call
     spec:
       containers:
         - name: order-service
@@ -426,12 +425,12 @@ metadata:
   namespace: dev
   labels:
     app: order-service
-    monitor: "true"
+    monitor: "true"           # ← PROMETHEUS: ServiceMonitor uses this label to find the service
 spec:
   selector:
     app: order-service
   ports:
-    - name: http
+    - name: http              # ← PROMETHEUS: ServiceMonitor references this port by name "http"
       port: 80
       targetPort: 8080
   type: ClusterIP
@@ -439,6 +438,18 @@ spec:
 
 > **All 8 services follow this exact pattern.** Only `name`, `image`, and `SERVICE_NAME` env var change. Copy-paste and update for:
 > `user-service`, `product-service`, `payment-service`, `inventory-service`, `notification-service`, `auth-service`.
+
+**What DevOps MUST add for Prometheus — the mandatory lines (out of the full YAML above):**
+
+| Line | Where | Why it is needed |
+|---|---|---|
+| `prometheus.io/scrape: "true"` | Deployment → `annotations` | Tells Prometheus to scrape this pod |
+| `prometheus.io/port: "8080"` | Deployment → `annotations` | Tells Prometheus which port has `/metrics` |
+| `prometheus.io/path: "/metrics"` | Deployment → `annotations` | Tells Prometheus the exact path to call |
+| `monitor: "true"` | Service → `labels` | ServiceMonitor selector matches on this label |
+| `name: http` | Service → `ports` | ServiceMonitor references the port by this name |
+
+Everything else in the YAML (replicas, resources, probes, env vars) is standard Kubernetes — not Prometheus-specific.
 
 ---
 
@@ -448,32 +459,25 @@ spec:
 
 **File: `k8s/servicemonitor-all.yaml`**
 ```yaml
-# This ONE object tells Prometheus to scrape ALL 8 services
-# in BOTH dev and test namespaces — no changes needed when adding new services
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: ecommerce-all-services
   namespace: monitoring
   labels:
-    release: kube-prometheus-stack   # Must match your Helm release name
+    release: kube-prometheus-stack   # ← PROMETHEUS: must match your Helm release name exactly
 spec:
-  # Watch BOTH namespaces — dev and test
   namespaceSelector:
     matchNames:
-      - dev
+      - dev                          # ← PROMETHEUS: namespaces to watch
       - test
-
-  # Only scrape services that have label: monitor="true"
   selector:
     matchLabels:
-      monitor: "true"
-
+      monitor: "true"               # ← PROMETHEUS: only scrape Services that have this label
   endpoints:
-    - port: http
-      path: /metrics
-      interval: 15s
-      # Add namespace and service labels to every metric
+    - port: http                    # ← PROMETHEUS: matches the port name "http" in the Service
+      path: /metrics                # ← PROMETHEUS: path on each pod to collect metrics from
+      interval: 15s                 # ← PROMETHEUS: how often to scrape (15s is standard)
       relabelings:
         - sourceLabels: [__meta_kubernetes_namespace]
           targetLabel: namespace
@@ -482,6 +486,17 @@ spec:
         - sourceLabels: [__meta_kubernetes_pod_name]
           targetLabel: pod
 ```
+
+**What DevOps MUST configure for Prometheus in this ServiceMonitor — the mandatory lines:**
+
+| Line | Why it is needed |
+|---|---|
+| `release: kube-prometheus-stack` | Prometheus Operator only picks up ServiceMonitors with this label matching the Helm release name |
+| `namespaceSelector.matchNames` | Tells Prometheus which namespaces to watch — add any new namespace here |
+| `selector.matchLabels: monitor: "true"` | Links this ServiceMonitor to only Services that have `monitor: "true"` label |
+| `port: http` | Must match the named port in the Service (`name: http`) |
+| `path: /metrics` | The URL path where your app exposes Prometheus metrics |
+| `interval: 15s` | Scrape frequency — lower = more data, higher = less load |
 
 ---
 

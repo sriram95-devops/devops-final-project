@@ -27,6 +27,12 @@ dependencies {
     // Micrometer Prometheus registry — converts Actuator metrics to Prometheus format
     runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
 
+    // Micrometer OTel bridge — connects Spring Boot tracing to OpenTelemetry
+    implementation 'io.micrometer:micrometer-tracing-bridge-otel'
+
+    // OTLP exporter — sends traces to Jaeger via OTLP HTTP protocol
+    implementation 'io.opentelemetry:opentelemetry-exporter-otlp'
+
     // Tests
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }

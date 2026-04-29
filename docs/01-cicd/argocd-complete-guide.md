@@ -86,29 +86,40 @@ ArgoCD solves this by:
 - Helm 3 installed
 - ArgoCD CLI installed
 
-### Method A: Install ArgoCD with kubectl
-
-```bash
-# Create namespace
-kubectl create namespace argocd
-
 # Apply the official installation manifest
-kubectl apply -n argocd \
-  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-```
 
-Expected output:
+### Method B: Install ArgoCD with Helm (**Tested & Working on Windows**)
 
-```
-customresourcedefinition.apiextensions.k8s.io/applications.argoproj.io created
-customresourcedefinition.apiextensions.k8s.io/applicationsets.argoproj.io created
+> This method is confirmed to work on Windows with Docker Desktop and kubectl configured for your cluster.
+
+```powershell
+# 1. Add the Argo Helm repo
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+
+# 2. Create the namespace (ignore error if it already exists)
 customresourcedefinition.apiextensions.k8s.io/appprojects.argoproj.io created
+
+# 3. Install ArgoCD with Helm
+helm install argocd argo/argo-cd \
 serviceaccount/argocd-application-controller created
 ...
 deployment.apps/argocd-server created
 ```
 
 Wait for all pods to be ready:
+```
+
+#### Troubleshooting
+- If you get an error about the namespace already existing, ignore it.
+- If Helm install fails, try deleting any failed release:
+  ```powershell
+  helm uninstall argocd -n argocd
+  kubectl delete namespace argocd
+  kubectl create namespace argocd
+  # Then re-run the helm install command above
+  ```
+- If you get a CRD annotation size error, delete the CRD as described in the Troubleshooting Guide.
 
 ```bash
 kubectl wait --for=condition=Available deployment --all -n argocd --timeout=300s
