@@ -1698,6 +1698,118 @@ curl -X POST http://admin:admin123@localhost:3000/api/dashboards/import \
   -d "{\"dashboard\": $(cat grafana-backup/<uid>.json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d[\"dashboard\"]))'), \"overwrite\": true}"
 ```
 
+### Issue 11: CrashLoopBackOff — Duplicate Default Datasource
+
+**Symptoms:** Grafana pod enters `CrashLoopBackOff`; logs show `datasource.yaml config is invalid. Only one datasource per organization can be marked as default`
+
+**Root Cause:** Using `kube-prometheus-stack`, the Helm chart auto-generates a Prometheus datasource ConfigMap with `isDefault: true`. If you also add a `grafana.datasources` block in `prometheus-stack-values.yaml` with `isDefault: true`, Grafana 12.x crashes on startup with a fatal duplicate-default error.
+
+**Diagnosis:**
+```bash
+kubectl logs deployment/kube-prometheus-stack-grafana -n monitoring -c grafana --previous | tail -20
+# Look for:
+# datasource.yaml config is invalid.
+# Only one datasource per organization can be marked as default
+```
+
+**Fix:** Remove the manual `grafana.datasources` block from `prometheus-stack-values.yaml` — the Helm chart creates it automatically:
+```yaml
+# DELETE this entire block from prometheus-stack-values.yaml
+# grafana:
+#   datasources:
+#     datasources.yaml:
+#       apiVersion: 1
+#       datasources:
+#         - name: Prometheus
+#           isDefault: true   ← conflicts with auto-generated one
+```
+```bash
+helm upgrade kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  --namespace monitoring -f k8s/prometheus-stack-values.yaml
+kubectl rollout status deployment/kube-prometheus-stack-grafana -n monitoring
+```
+
+---
+
+### Issue 12: Dashboards Empty After Upgrade — Path Mismatch
+
+**Symptoms:** Grafana is `3/3 Running`, datasource health check passes, but dashboards list is completely empty after a `helm upgrade`.
+
+**Root Cause:** Path mismatch between where the init container downloads dashboards (`/var/lib/grafana/dashboards/default/`) and where Grafana's provisioning config watches (`/tmp/dashboards`).
+
+**Diagnosis:**
+```bash
+# Confirm dashboard files exist in the pod
+kubectl exec -n monitoring deployment/kube-prometheus-stack-grafana \
+  -c grafana -- ls /var/lib/grafana/dashboards/default/
+# Output: k8s-cluster.json  node-exporter-full.json  ← files ARE there
+
+# Check what path Grafana's provisioning watches
+kubectl exec -n monitoring deployment/kube-prometheus-stack-grafana \
+  -c grafana -- cat /etc/grafana/provisioning/dashboards/sc-dashboardproviders.yaml
+# Look for: path: /tmp/dashboards  ← DIFFERENT from where files are
+```
+
+**Fix:** Add a `dashboardProviders` entry in `prometheus-stack-values.yaml` that matches the actual path:
+```yaml
+grafana:
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: 'default'
+          orgId: 1
+          folder: ''
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default   # ← match actual path
+```
+```bash
+helm upgrade kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  --namespace monitoring -f k8s/prometheus-stack-values.yaml
+```
+
+---
+
+### Issue 13: Grafana EXTERNAL-IP Stays `<pending>` on Minikube
+
+**Symptoms:**
+```bash
+kubectl get svc kube-prometheus-stack-grafana -n monitoring
+# NAME                            TYPE           EXTERNAL-IP
+# kube-prometheus-stack-grafana   LoadBalancer   <pending>
+```
+Browser cannot reach Grafana.
+
+**Root Cause:** On Minikube, `LoadBalancer` services never get an external IP — Minikube has no cloud load balancer provider.
+
+**Fix — port-forward (local dev):**
+```bash
+kubectl port-forward svc/kube-prometheus-stack-grafana 3001:80 -n monitoring
+# Open: http://localhost:3001
+# Use port 3001 if 3000 is already in use
+```
+
+**Fix — NodePort (persistent, survives terminal close):**
+```bash
+kubectl patch svc kube-prometheus-stack-grafana -n monitoring \
+  -p '{"spec": {"type": "NodePort"}}'
+kubectl get svc kube-prometheus-stack-grafana -n monitoring
+minikube ip
+# Open: http://<minikube-ip>:<nodeport>
+```
+
+**Fix — minikube tunnel (exposes LoadBalancer as 127.0.0.1):**
+```bash
+minikube tunnel   # keep this terminal open
+kubectl get svc kube-prometheus-stack-grafana -n monitoring
+# EXTERNAL-IP now shows 127.0.0.1
+```
+
+> On AKS, EKS, and GKE, `LoadBalancer` works automatically. This issue is Minikube-only.
+
 ---
 
 ## 9. Grafana Cheat Sheet

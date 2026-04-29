@@ -1789,6 +1789,194 @@ kubectl exec -n monitoring \
 kubectl get configmap -n monitoring grafana-datasources -o yaml
 ```
 
+### Issue 11: Target Disappears After Pod Scaled to Zero
+
+**Symptoms:** After `kubectl scale deployment <name> -n dev --replicas=0`, the target vanishes from Prometheus Targets page entirely — it does not show `up=0`, it is completely absent. PromQL `up{job="product-service"}` returns no results.
+
+**Root Cause:** Prometheus discovers targets via Kubernetes Service endpoints. With 0 replicas, the Service has no Endpoints, so Prometheus removes the target from its scrape list completely.
+
+**Correct PromQL to detect scale-to-zero:**
+```promql
+# Detect the service is absent
+absent(up{namespace="dev", job="product-service"})
+# Returns: 1 when product-service has no running pods
+
+# Desired vs available replicas (kube-state-metrics still tracks the deployment)
+kube_deployment_spec_replicas{namespace="dev"}
+  - kube_deployment_status_replicas_available{namespace="dev"}
+# Returns: non-zero for scaled-down deployments
+```
+
+> Scaling to 0 is NOT the right way to test Prometheus monitoring. Use a bad liveness probe instead (see Issue 12) — pods stay visible with `up=0` while crashing.
+
+---
+
+### Issue 12: CrashLooping Pod Shows up=0
+
+**How to reproduce:** Inject a bad liveness probe path:
+```bash
+kubectl patch deployment product-service -n dev --type='json' \
+  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/httpGet/path","value":"/bad-path"}]'
+```
+
+**What Prometheus shows:**
+```promql
+up{namespace="dev", job="product-service"}
+# Mixed 0 and 1 depending on whether pod is in crash window
+
+kube_pod_container_status_restarts_total{namespace="dev", pod=~"product-service.*"}
+# Returns: increasing counter every few seconds
+
+increase(kube_pod_container_status_restarts_total{namespace="dev", pod=~"product-service.*"}[5m])
+# Returns: restart count in last 5 minutes
+```
+
+**Alert rule:**
+```yaml
+alert: KubePodCrashLooping
+expr: increase(kube_pod_container_status_restarts_total[15m]) > 3
+for: 5m
+labels:
+  severity: critical
+annotations:
+  summary: "Pod {{ $labels.pod }} is crash-looping"
+  description: "Restarted {{ $value }} times in 15m in {{ $labels.namespace }}"
+```
+
+**Rollback after testing:**
+```bash
+kubectl rollout undo deployment/product-service -n dev
+kubectl rollout status deployment/product-service -n dev
+```
+
+---
+
+### Issue 13: New Namespace Not Being Scraped
+
+**Symptoms:** New namespace `staging` deployed with apps and `monitor: "true"` labels, but no metrics appear in Prometheus for those apps.
+
+**Root Cause:** The `ServiceMonitor` `namespaceSelector.matchNames` list does not include the new namespace — Prometheus ignores it.
+
+**Fix:** Update `servicemonitor-all.yaml`:
+```yaml
+spec:
+  namespaceSelector:
+    matchNames:
+      - dev
+      - test
+      - staging    # ← add every new namespace here
+```
+```bash
+kubectl apply -f k8s/servicemonitor-all.yaml
+# Targets appear within 30 seconds
+kubectl label namespace staging monitored-by=prometheus
+```
+
+---
+
+### Issue 14: Service Missing from Targets — Wrong Label
+
+**Symptoms:** New service deployed in `dev` but does not appear in Prometheus targets.
+
+**Root Cause:** The `ServiceMonitor` selector requires `monitor: "true"` on the Kubernetes **Service** object. Missing label = Prometheus ignores the service.
+
+**Diagnosis:**
+```bash
+kubectl get svc -n dev --show-labels
+# Check LABELS column for monitor=true
+
+# Find any service MISSING the label
+kubectl get svc -n dev -l '!monitor'
+# If this returns results → those services are invisible to Prometheus
+```
+
+**Fix:**
+```bash
+# Add label to existing service
+kubectl label svc <service-name> monitor="true" -n dev
+```
+```yaml
+# In the Service manifest — add permanently
+metadata:
+  labels:
+    monitor: "true"     # ← Required for ServiceMonitor discovery
+    app: my-service
+```
+
+---
+
+### Issue 15: RBAC Forbidden Error on ServiceMonitor
+
+**Symptoms:** Prometheus Operator logs show `unable to list services in namespace dev: forbidden`. ServiceMonitor exists but no targets discovered.
+
+**Diagnosis:**
+```bash
+kubectl auth can-i list services -n dev \
+  --as=system:serviceaccount:monitoring:kube-prometheus-stack-prometheus
+# Returns "no" → RBAC is the problem
+```
+
+**Fix:** Apply a ClusterRole and ClusterRoleBinding:
+```yaml
+# k8s/rbac-prometheus-cross-namespace.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-cross-namespace-reader
+rules:
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-cross-namespace-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-cross-namespace-reader
+subjects:
+  - kind: ServiceAccount
+    name: kube-prometheus-stack-prometheus
+    namespace: monitoring
+```
+```bash
+kubectl apply -f k8s/rbac-prometheus-cross-namespace.yaml
+kubectl auth can-i list services -n dev \
+  --as=system:serviceaccount:monitoring:kube-prometheus-stack-prometheus
+# Returns: yes ✅
+```
+
+---
+
+### Issue 16: Prometheus OOMKilled
+
+**Symptoms:**
+```bash
+kubectl get pods -n monitoring
+# prometheus-kube-prometheus-stack-prometheus-0   0/2   OOMKilled   3
+```
+
+**Root Cause:** Memory `limits` in Helm values too low for the number of metrics being collected.
+
+**Fix:** Increase memory in `prometheus-stack-values.yaml`:
+```yaml
+prometheus:
+  prometheusSpec:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi    # ← increase from 512Mi to 2Gi
+```
+```bash
+helm upgrade kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  --namespace monitoring -f k8s/prometheus-stack-values.yaml
+```
+
 ---
 
 ## 9. PromQL Cheat Sheet

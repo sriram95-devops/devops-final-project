@@ -1185,30 +1185,8 @@ kubectl annotate pod -n argocd \
 
 ### 5.4 Grafana: Elasticsearch as Data Source
 
-```bash
-# Add Elasticsearch to Grafana (see Grafana guide for full config)
-curl -X POST http://admin:admin123@localhost:3000/api/datasources \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"name\": \"Elasticsearch-K8s-Logs\",
-    \"type\": \"elasticsearch\",
-    \"access\": \"proxy\",
-    \"url\": \"http://elasticsearch-es-http.elastic.svc.cluster.local:9200\",
-    \"database\": \"k8s-logs-*\",
-    \"jsonData\": {
-      \"esVersion\": \"8.0.0\",
-      \"timeField\": \"@timestamp\",
-      \"interval\": \"Daily\",
-      \"logLevelField\": \"log.level\",
-      \"logMessageField\": \"message\"
-    },
-    \"basicAuth\": true,
-    \"basicAuthUser\": \"elastic\",
-    \"secureJsonData\": {
-      \"basicAuthPassword\": \"$ES_PASSWORD\"
-    }
-  }"
-```
+> The complete Grafana datasource API command for adding Elasticsearch (including all `jsonData` fields, `basicAuth`, and log field mapping) is documented in:
+> **[grafana-complete-guide.md — Section 5.3 ELK: Elasticsearch Data Source for Log Correlation](grafana-complete-guide.md)**
 
 ---
 

@@ -296,43 +296,8 @@ const logger = winston.createLogger({
 
 ### Grafana: Linking Metrics to Logs to Traces
 
-```yaml
-# In Grafana datasource configuration:
-# When viewing a Prometheus metric in Explore, Grafana can show related logs and traces
-
-# 1. Prometheus → Logs correlation
-# Configure in datasource:
-datasources:
-  - name: Prometheus
-    type: prometheus
-    jsonData:
-      exemplarTraceIdDestinations:
-        - name: traceID              # Exemplar label containing trace ID
-          datasourceUid: jaeger      # Link to Jaeger datasource
-
-# 2. Jaeger → Logs correlation  
-  - name: Jaeger
-    type: jaeger
-    jsonData:
-      tracesToLogsV2:
-        datasourceUid: elasticsearch
-        filterByTraceID: true
-        # Map Jaeger service.name to ES kubernetes.labels.app field
-        tags:
-          - key: "service.name"
-            value: "kubernetes.labels.app"
-
-# 3. Logs → Traces correlation
-  - name: Elasticsearch
-    type: elasticsearch
-    jsonData:
-      derivedFields:
-        - datasourceUid: jaeger
-          matcherRegex: "trace_id=([a-f0-9]{32})"
-          name: TraceID
-          url: "$${__value.raw}"
-          urlDisplayLabel: "View Trace in Jaeger"
-```
+> The full annotated datasource configuration YAML (Prometheus exemplar → Jaeger, Jaeger `tracesToLogsV2`, Elasticsearch `derivedFields`) is in:
+> **[grafana-complete-guide.md — Section 4.1 Datasource Configuration](grafana-complete-guide.md)**
 
 ### Correlation Query Workflow
 
